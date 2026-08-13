@@ -1,0 +1,54 @@
+# =============================================================================
+# Dockerfile.serve – Container für den Inferenz-Server (Flask REST-API)
+# =============================================================================
+#
+# Unterschied zu Dockerfile.train:
+#   - Kein Training-Code, nur serve.py + Flask
+#   - Statt CMD python train.py → CMD python serve.py
+#   - Port 8080 wird freigegeben (EXPOSE)
+#   - Healthcheck prüft den HTTP-Endpoint /health
+#
+# In Produktion würde man oft einen "Multi-Stage-Build" verwenden:
+#   Stage 1: Build-Image (mit gcc, wheel-Compilern etc.)
+#   Stage 2: Runtime-Image (nur das fertige .whl, kein Build-Tooling)
+#   → noch kleineres finales Image
+# Hier verzichten wir darauf für Übersichtlichkeit.
+#
+# =============================================================================
+
+FROM python:3.11-slim
+
+LABEL maintainer="ml-team@example.com"
+LABEL description="ML Inference Server – Iris Classifier REST API"
+LABEL version="1.0"
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY src/serve.py ./src/serve.py
+
+# ---------------------------------------------------------------------------
+# EXPOSE dokumentiert, welchen Port der Container nutzt.
+# Es öffnet den Port NICHT wirklich – das macht "docker run -p 8080:8080".
+# Es ist reine Dokumentation für den Container-Nutzer.
+# ---------------------------------------------------------------------------
+EXPOSE 8080
+
+ENV MLFLOW_TRACKING_URI="http://mlflow:5000"
+ENV MODEL_URI="models:/IrisClassifier/Production"
+ENV PORT="8080"
+
+# ---------------------------------------------------------------------------
+# Healthcheck über den HTTP-Endpoint /health
+# curl --fail gibt Exit-Code 1 zurück wenn HTTP-Status != 2xx
+# → Docker markiert Container als unhealthy wenn /health nicht 200 antwortet
+# ---------------------------------------------------------------------------
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=30s \
+    CMD curl --fail http://localhost:8080/health || exit 1
+
+RUN useradd --create-home --shell /bin/bash mluser
+USER mluser
+
+CMD ["python", "src/serve.py"]

@@ -1,0 +1,141 @@
+# =============================================================================
+# docker-compose.yml – Lokale Entwicklungsumgebung
+# =============================================================================
+#
+# Was ist Docker Compose?
+#   Ein Tool, um mehrere Container gleichzeitig zu starten und zu vernetzen.
+#   Statt 4 "docker run"-Befehle zu tippen: "docker compose up"
+#
+# Unsere Services:
+#   1. mlflow     – Tracking-Server + Model Registry (UI auf Port 5000)
+#   2. training   – Trainings-Job (läuft durch, stoppt danach)
+#   3. serving    – Flask-Inferenzserver (läuft dauerhaft)
+#
+# Netzwerk:
+#   Alle Services sind im selben Docker-Netzwerk "ml-net".
+#   Sie erkennen sich per Servicenamen:
+#     "mlflow" → http://mlflow:5000 (nicht http://localhost:5000)
+#   localhost ist im Container der Container selbst, nicht der Host.
+#
+# Volumes:
+#   mlflow-data → MLflow-Datenbank + Artefakte überleben Container-Neustart
+#   Ohne Volume: bei "docker compose down" sind alle Runs weg!
+#
+# =============================================================================
+
+version: "3.9"
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Service 1: MLflow Tracking Server
+  #
+  # --backend-store-uri: Wo MLflow Runs/Metriken/Params speichert.
+  #   sqlite:///mlflow.db = lokale SQLite-Datenbank (einfach, kein extra DB-Server)
+  #   In Produktion: postgresql://user:pass@host/db
+  #
+  # --default-artifact-root: Wo Modell-Artefakte (pickle, conda.yaml etc.) landen.
+  #   /mlflow/artifacts = im Container (gemountet auf mlflow-data-Volume)
+  #   In Produktion: s3://mein-bucket/mlflow-artifacts
+  #
+  # --host 0.0.0.0: Lauscht auf allen Netzwerk-Interfaces im Container
+  #   (notwendig damit andere Container und der Host ihn erreichen können)
+  # ---------------------------------------------------------------------------
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.10.0    # Offizielles MLflow-Image
+    ports:
+      - "5000:5000"                           # Host-Port:Container-Port
+    volumes:
+      - mlflow-data:/mlflow                  # Persistenz für Runs + Artefakte
+    command: >
+      mlflow server
+        --backend-store-uri sqlite:////mlflow/mlflow.db
+        --default-artifact-root /mlflow/artifacts
+        --host 0.0.0.0
+        --port 5000
+    networks:
+      - ml-net
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Service 2: Training-Job
+  #
+  # depends_on + condition: Der Trainings-Container startet ERST,
+  # wenn MLflow "service_healthy" ist (Healthcheck erfolgreich).
+  # Warum wichtig?
+  #   train.py ruft mlflow.start_run() auf → MLflow muss schon laufen.
+  #   Ohne depends_on würde train.py mit "Connection refused" scheitern.
+  #
+  # restart: "no"
+  #   Der Job läuft einmal durch und stoppt. Docker soll ihn nicht neu starten.
+  #   (Im Gegensatz zu serving, das immer laufen soll.)
+  #
+  # environment:
+  #   Hyperparameter werden als Umgebungsvariablen übergeben.
+  #   So kann derselbe Container ohne Code-Änderung unterschiedlich konfiguriert werden.
+  # ---------------------------------------------------------------------------
+  training:
+    build:
+      context: ..                             # Build-Kontext = Projektroot
+      dockerfile: docker/Dockerfile.train
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    environment:
+      MLFLOW_TRACKING_URI: "http://mlflow:5000"
+      N_ESTIMATORS: "100"
+      MAX_DEPTH: "None"
+      RANDOM_STATE: "42"
+      TEST_SIZE: "0.2"
+      MIN_ACCURACY: "0.90"
+    networks:
+      - ml-net
+    restart: "no"                             # Job läuft einmal, kein Restart
+
+  # ---------------------------------------------------------------------------
+  # Service 3: Inferenz-Server
+  #
+  # Der Serving-Container startet erst wenn Training abgeschlossen ist.
+  # service_completed_successfully: Warte bis training exit code 0 hat.
+  # (Bei exit code 1 = MIN_ACCURACY unterschritten → serving startet nicht)
+  # ---------------------------------------------------------------------------
+  serving:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.serve
+    depends_on:
+      mlflow:
+        condition: service_healthy
+      training:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8080"
+    environment:
+      MLFLOW_TRACKING_URI: "http://mlflow:5000"
+      MODEL_URI: "models:/IrisClassifier/Production"
+      PORT: "8080"
+    networks:
+      - ml-net
+    restart: unless-stopped               # Startet bei Absturz neu, aber nicht bei "docker compose down"
+
+# ---------------------------------------------------------------------------
+# Volumes: Benannte Docker-Volumes überleben Container-Zyklen
+# "docker compose down" entfernt Container, aber nicht Volumes
+# "docker compose down -v" entfernt auch Volumes (Daten verloren!)
+# ---------------------------------------------------------------------------
+volumes:
+  mlflow-data:
+    driver: local
+
+# ---------------------------------------------------------------------------
+# Netzwerk: Isoliertes Netzwerk für die Pipeline
+# Services können sich nur gegenseitig per Name erreichen,
+# nicht andere Docker-Netzwerke auf dem Host.
+# ---------------------------------------------------------------------------
+networks:
+  ml-net:
+    driver: bridge

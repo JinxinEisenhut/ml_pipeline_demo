@@ -1,0 +1,97 @@
+# =============================================================================
+# Dockerfile.train – Container für den Trainings-Job
+# =============================================================================
+#
+# Was ist ein Dockerfile?
+#   Eine Rezept-Datei. Docker liest sie Zeile für Zeile und baut daraus ein
+#   Image (eine unveränderliche Schicht-Aufnahme des Systems).
+#   Jedes "RUN", "COPY", "ENV" erzeugt eine neue Layer.
+#
+# Warum python:3.11-slim und nicht python:3.11?
+#   "slim" = minimales Debian ohne unnötige Tools (kein gcc, kein vim, etc.)
+#   → kleines Image (~150 MB statt ~1 GB), schnelleres Docker-Pull in CI
+#   → kleinere Angriffsfläche (weniger Pakete = weniger Sicherheitslücken)
+#
+# Layer-Caching-Strategie (wichtig für schnelle Builds!):
+#   Docker cached jede Layer. Ändert sich eine Datei, werden ALLE nachfolgenden
+#   Layer neu gebaut. Deshalb:
+#     1. zuerst requirements.txt kopieren + pip install (selten geändert → gecached)
+#     2. DANN src/ kopieren (häufig geändert → nur diese Layer neu)
+#   Würde man alles auf einmal kopieren, müsste pip bei jedem Code-Commit
+#   alle Pakete neu installieren. Das kostet Minuten.
+#
+# =============================================================================
+
+FROM python:3.11-slim
+
+# ---------------------------------------------------------------------------
+# System-Labels (Best Practice: Metadaten ins Image einbetten)
+# Wer hat das Image gebaut? Für was ist es? Jenkins kann diese auslesen.
+# ---------------------------------------------------------------------------
+LABEL maintainer="ml-team@example.com"
+LABEL description="ML Training Container – Iris Classifier"
+LABEL version="1.0"
+
+# ---------------------------------------------------------------------------
+# Arbeitsverzeichnis im Container
+# Alle nachfolgenden COPY/RUN-Befehle arbeiten relativ zu /app
+# ---------------------------------------------------------------------------
+WORKDIR /app
+
+# ---------------------------------------------------------------------------
+# Layer 1: Abhängigkeiten (wird gecached, solange requirements.txt unverändert)
+# --no-cache-dir: pip speichert keine Download-Caches → kleineres Image
+# ---------------------------------------------------------------------------
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ---------------------------------------------------------------------------
+# Layer 2: Anwendungscode (wird bei jedem Code-Push neu gebaut)
+# ---------------------------------------------------------------------------
+COPY src/ ./src/
+COPY tests/ ./tests/
+
+# ---------------------------------------------------------------------------
+# Umgebungsvariablen (Defaults, können beim docker run überschrieben werden)
+#
+# MLFLOW_TRACKING_URI: Wo MLflow läuft.
+#   Im Docker-Compose-Netzwerk erreichbar über Servicenamen "mlflow".
+#   Lokal: http://localhost:5000
+#
+# Hyperparameter können beim Start überschrieben werden:
+#   docker run -e N_ESTIMATORS=200 -e MAX_DEPTH=5 ml-train
+# ---------------------------------------------------------------------------
+ENV MLFLOW_TRACKING_URI="http://mlflow:5000"
+ENV N_ESTIMATORS="100"
+ENV MAX_DEPTH="None"
+ENV RANDOM_STATE="42"
+ENV TEST_SIZE="0.2"
+ENV MIN_ACCURACY="0.90"
+
+# ---------------------------------------------------------------------------
+# Healthcheck (Docker prüft den Container-Status)
+# interval: alle 30s prüfen
+# timeout:  nach 10s aufgeben
+# retries:  nach 3 Fehlschlägen als "unhealthy" markieren
+# startPeriod: 60s Anlaufzeit bevor Checks starten
+#
+# Für den Training-Container macht ein HTTP-Healthcheck weniger Sinn
+# (kein Server), daher prüfen wir ob Python funktioniert.
+# ---------------------------------------------------------------------------
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=60s \
+    CMD python -c "import mlflow; print('OK')" || exit 1
+
+# ---------------------------------------------------------------------------
+# Nicht als root laufen! (Sicherheits-Best-Practice)
+# Root im Container hat weitreichende Rechte auf dem Host.
+# Ein eigener "mluser" begrenzt den Schaden bei Container-Escape.
+# ---------------------------------------------------------------------------
+RUN useradd --create-home --shell /bin/bash mluser
+USER mluser
+
+# ---------------------------------------------------------------------------
+# Einstiegspunkt: Was soll beim "docker run" ausgeführt werden?
+# CMD kann durch "docker run <image> python andere_datei.py" überschrieben werden.
+# ENTRYPOINT wäre strenger (kann nicht überschrieben werden).
+# ---------------------------------------------------------------------------
+CMD ["python", "src/train.py"]
