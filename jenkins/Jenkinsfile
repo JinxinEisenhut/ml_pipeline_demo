@@ -1,42 +1,3 @@
-/*
- * Jenkinsfile – Iris-Classifier ML-Pipeline (korrigierte Version)
- * ================================================================
- *
- * FEHLER-ANALYSE der vorherigen Version:
- *
- *   Fehler 1: "python3: not found"
- *     Ursache:  Stage "Setup" rief python3 direkt auf dem Jenkins-Agent auf.
- *               Der Jenkins-Docker-Container (jenkins/jenkins:lts-jdk17)
- *               enthält aber nur Java – kein Python.
- *     Lösung:   Tests laufen jetzt INNERHALB des Training-Containers.
- *               Der Container hat Python (via Dockerfile.train).
- *               Jenkins selbst braucht kein Python mehr.
- *
- *   Fehler 2: "docker: not found"
- *     Ursache:  Docker-CLI war nicht im Jenkins-Container installiert.
- *               /var/run/docker.sock allein genügt nicht – die CLI fehlt.
- *     Lösung:   Docker-CLI im Jenkins-Container einmalig installieren.
- *               Anleitung: siehe SETUP.md Schritt 4b.
- *               ODER: agent { docker } nutzen (siehe unten).
- *
- * ARCHITEKTUR dieser Version:
- *   Jenkins-Agent selbst macht NUR: git checkout, docker build, docker run.
- *   Python, pytest, pip – alles läuft INNERHALB von Docker-Containern.
- *   Das ist die korrekte Produktions-Architektur.
- *
- *                 Jenkins-Agent (braucht nur: git + docker)
- *                      │
- *          ┌───────────┼───────────┐
- *          ▼           ▼           ▼
- *    docker build   docker run  docker run
- *    (Image bauen) (Tests+Train)(Serving)
- *          │           │
- *    Dockerfile.train  └─ python3, pytest, mlflow
- *                         alles im Container
- * new jenkins file
- /
-
-
 pipeline {
 
     agent any
@@ -61,66 +22,25 @@ pipeline {
     }
 
     parameters {
-        string(
-            name:         'N_ESTIMATORS',
-            defaultValue: '100',
-            description:  'Anzahl Bäume im RandomForest'
-        )
-        string(
-            name:         'MAX_DEPTH',
-            defaultValue: 'None',
-            description:  'Maximale Baumtiefe (None = unbegrenzt)'
-        )
-        choice(
-            name:         'ENVIRONMENT',
-            choices:      ['staging', 'production'],
-            description:  'Ziel-Deployment-Umgebung'
-        )
+        string(name: 'N_ESTIMATORS', defaultValue: '100', description: 'Anzahl Bäume im RandomForest')
+        string(name: 'MAX_DEPTH',    defaultValue: 'None', description: 'Maximale Baumtiefe')
+        choice(name: 'ENVIRONMENT',  choices: ['staging', 'production'], description: 'Ziel-Umgebung')
     }
 
     stages {
 
-        // -----------------------------------------------------------------
-        // Stage 1: Checkout
-        // Jenkins holt den Code aus GitHub.
-        // Keine Änderung nötig – hat bereits funktioniert (Log zeigte OK).
-        // -----------------------------------------------------------------
         stage('Checkout') {
             steps {
                 checkout scm
-                echo "=== Build #${BUILD_NUMBER} ==="
-                echo "Commit: ${GIT_COMMIT}"
-                echo "Branch: ${GIT_BRANCH}"
+                echo "=== Build #${BUILD_NUMBER} | Commit: ${GIT_COMMIT} | Branch: ${GIT_BRANCH} ==="
                 echo "N_ESTIMATORS=${params.N_ESTIMATORS} | MAX_DEPTH=${params.MAX_DEPTH}"
             }
         }
 
-        // -----------------------------------------------------------------
-        // Stage 2: Docker Build
-        //
-        // VORHER: Stage "Setup" (python3 -m venv) → FEHLER
-        // JETZT:  Direkt Docker bauen. Das Image enthält Python.
-        //
-        // Warum Docker zuerst, Tests danach?
-        //   Wir brauchen das Image um darin Tests zu laufen.
-        //   Der Container ist unsere "virtuelle Umgebung" –
-        //   sauberer als venv direkt auf dem Agent.
-        //
-        // || true beim cache-from:
-        //   Beim allerersten Build existiert kein "latest"-Image.
-        //   Ohne || true würde "cache-from" mit Fehler abbrechen.
-        //   Mit || true: Cache-Fehler wird ignoriert, Build läuft durch.
-        // -----------------------------------------------------------------
         stage('Docker Build') {
             steps {
                 sh """
-                    echo "Baue Training-Image …"
                     docker build \\
-                        --tag ${DOCKER_REGISTRY}/${IMAGE_NAME}-train:${IMAGE_TAG} \\
-                        --tag ${DOCKER_REGISTRY}/${IMAGE_NAME}-train:latest \\
-                        --file docker/Dockerfile.train \\
-                        --cache-from ${DOCKER_REGISTRY}/${IMAGE_NAME}-train:latest \\
-                        . || docker build \\
                         --tag ${DOCKER_REGISTRY}/${IMAGE_NAME}-train:${IMAGE_TAG} \\
                         --tag ${DOCKER_REGISTRY}/${IMAGE_NAME}-train:latest \\
                         --file docker/Dockerfile.train \\
@@ -129,61 +49,26 @@ pipeline {
             }
         }
 
-        // -----------------------------------------------------------------
-        // Stage 3: Tests (laufen INNERHALB des Docker-Containers)
-        //
-        // VORHER: python3 direkt auf Agent → "python3: not found"
-        // JETZT:  docker run → pytest läuft im Container
-        //
-        // --rm:           Container nach Abschluss automatisch löschen
-        // --network host: Container sieht localhost des Hosts
-        //                 (wichtig für MLflow-Verbindung in späteren Stages)
-        // --workdir:      Arbeitsverzeichnis im Container
-        //
-        // Warum kein --volume für test-results.xml?
-        //   Das XML liegt nach dem Container-Run nicht mehr da (--rm).
-        //   Lösung: Volume mounten damit Jenkins die Datei lesen kann.
-        //   ${WORKSPACE} ist Jenkins' Arbeitsverzeichnis auf dem Host.
-        // -----------------------------------------------------------------
         stage('Tests') {
             steps {
                 sh """
-                    echo "Starte Tests im Docker-Container …"
                     docker run --rm \\
                         --volume ${WORKSPACE}:/app/workspace \\
                         --workdir /app \\
                         ${DOCKER_REGISTRY}/${IMAGE_NAME}-train:${IMAGE_TAG} \\
-                        sh -c "
-                            pip install pytest --quiet &&
-                            pytest tests/ -v --tb=short \\
-                                --junitxml=/app/workspace/test-results.xml \\
-                                --log-cli-level=INFO
-                        "
+                        sh -c "pytest tests/ -v --tb=short --junitxml=/app/workspace/test-results.xml"
                 """
             }
             post {
                 always {
-                    // test-results.xml liegt jetzt im WORKSPACE (via Volume)
                     junit allowEmptyResults: true, testResults: 'test-results.xml'
                 }
             }
         }
 
-        // -----------------------------------------------------------------
-        // Stage 4: Training
-        //
-        // MLFLOW_TRACKING_URI kommt aus Jenkins Credentials (maskiert im Log).
-        // Der Container verbindet sich über --network host mit MLflow.
-        //
-        // Wichtig: MLflow muss auf dem Host laufen und erreichbar sein.
-        //   Lokal (Docker Desktop Mac/Windows): host.docker.internal:5000
-        //   Lokal (Linux):                      172.17.0.1:5000
-        //   → In SETUP.md Schritt 5b erklärt wie man das Credential setzt.
-        // -----------------------------------------------------------------
         stage('Training') {
             steps {
                 sh """
-                    echo "Starte Training im Docker-Container …"
                     docker run --rm \\
                         --network host \\
                         --volume ${WORKSPACE}:/app/workspace \\
@@ -197,17 +82,10 @@ pipeline {
             }
         }
 
-        // -----------------------------------------------------------------
-        // Stage 5: Serving-Image bauen
-        // -----------------------------------------------------------------
         stage('Build Serving Image') {
             steps {
                 sh """
                     docker build \\
-                        --tag ${DOCKER_REGISTRY}/${IMAGE_NAME}-serve:${IMAGE_TAG} \\
-                        --tag ${DOCKER_REGISTRY}/${IMAGE_NAME}-serve:latest \\
-                        --file docker/Dockerfile.serve \\
-                        . || docker build \\
                         --tag ${DOCKER_REGISTRY}/${IMAGE_NAME}-serve:${IMAGE_TAG} \\
                         --tag ${DOCKER_REGISTRY}/${IMAGE_NAME}-serve:latest \\
                         --file docker/Dockerfile.serve \\
@@ -216,24 +94,14 @@ pipeline {
             }
         }
 
-        // -----------------------------------------------------------------
-        // Stage 6: Deploy
-        //
-        // Nur auf main-Branch.
-        // Stoppt den alten Container und startet den neuen.
-        // || true: kein Fehler wenn beim ersten Mal noch kein Container läuft.
-        // -----------------------------------------------------------------
         stage('Deploy') {
             when {
                 branch 'main'
             }
             steps {
                 sh """
-                    echo "Stoppe alten Serving-Container (falls vorhanden) …"
                     docker stop iris-serve || true
                     docker rm   iris-serve || true
-
-                    echo "Starte neue Version: ${IMAGE_TAG} …"
                     docker run -d \\
                         --name iris-serve \\
                         --network host \\
@@ -242,12 +110,8 @@ pipeline {
                         --env MODEL_URI=models:/IrisClassifier/Production \\
                         --env PORT=8080 \\
                         ${DOCKER_REGISTRY}/${IMAGE_NAME}-serve:${IMAGE_TAG}
-
-                    echo "Warte 10s auf Container-Start …"
                     sleep 10
-                    curl --fail --silent http://localhost:8080/health \\
-                        && echo "Deployment erfolgreich!" \\
-                        || (echo "Healthcheck fehlgeschlagen!" && exit 1)
+                    curl --fail --silent http://localhost:8080/health && echo "Deploy OK" || exit 1
                 """
             }
         }
@@ -258,10 +122,9 @@ pipeline {
             echo "Pipeline #${BUILD_NUMBER} erfolgreich! Tag: ${IMAGE_TAG}"
         }
         failure {
-            echo "Pipeline #${BUILD_NUMBER} fehlgeschlagen. Prüfe die Stage-Logs oben."
+            echo "Pipeline #${BUILD_NUMBER} fehlgeschlagen."
         }
         always {
-            // Aufräumen – kein python3 nötig, nur shell-Befehle
             sh 'rm -f test-results.xml || true'
             sh 'docker image prune -f || true'
         }
