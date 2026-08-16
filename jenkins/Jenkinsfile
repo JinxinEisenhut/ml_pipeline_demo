@@ -1,71 +1,54 @@
 /*
- * Jenkinsfile – Iris-Classifier ML-Pipeline
- * ==========================================
+ * Jenkinsfile – Iris-Classifier ML-Pipeline (korrigierte Version)
+ * ================================================================
  *
- * VORAUSSETZUNGEN (einmalig in Jenkins einrichten, siehe SETUP.md):
- *   - Jenkins Plugin: "Pipeline" (meist vorinstalliert)
- *   - Jenkins Plugin: "Git"
- *   - Jenkins Plugin: "Docker Pipeline"
- *   - Jenkins Credential: 'mlflow-tracking-uri'  (Secret Text)
- *   - Jenkins Credential: 'docker-registry-creds' (Username+Password)
+ * FEHLER-ANALYSE der vorherigen Version:
  *
- * WIE WIRD DIESE PIPELINE GETRIGGERT?
- *   Option A (empfohlen): GitHub/GitLab Webhook
- *     → Bei git push sendet GitHub einen HTTP POST an Jenkins
- *     → Jenkins startet automatisch die Pipeline
- *   Option B: SCM Polling (ohne öffentliche Jenkins-URL)
- *     → Jenkins fragt Git alle 5 Minuten ab: "Gibt es neue Commits?"
- *     → pollSCM('H/5 * * * *') im triggers-Block
+ *   Fehler 1: "python3: not found"
+ *     Ursache:  Stage "Setup" rief python3 direkt auf dem Jenkins-Agent auf.
+ *               Der Jenkins-Docker-Container (jenkins/jenkins:lts-jdk17)
+ *               enthält aber nur Java – kein Python.
+ *     Lösung:   Tests laufen jetzt INNERHALB des Training-Containers.
+ *               Der Container hat Python (via Dockerfile.train).
+ *               Jenkins selbst braucht kein Python mehr.
  *
- * REIHENFOLGE DER STAGES (Logik: billig vor teuer):
- *   1. Checkout  → Code holen (Pflicht)
- *   2. Setup     → Python-Umgebung (schnell, ~30s)
- *   3. Tests     → pytest (schnell, ~10s) – Fehler hier = kein Docker-Build
- *   4. Build     → docker build (~2min) – nur wenn Tests grün
- *   5. Training  → docker run (~5min)  – nur wenn Build OK
- *   6. Serve     → Serving-Image bauen + starten
- */
+ *   Fehler 2: "docker: not found"
+ *     Ursache:  Docker-CLI war nicht im Jenkins-Container installiert.
+ *               /var/run/docker.sock allein genügt nicht – die CLI fehlt.
+ *     Lösung:   Docker-CLI im Jenkins-Container einmalig installieren.
+ *               Anleitung: siehe SETUP.md Schritt 4b.
+ *               ODER: agent { docker } nutzen (siehe unten).
+ *
+ * ARCHITEKTUR dieser Version:
+ *   Jenkins-Agent selbst macht NUR: git checkout, docker build, docker run.
+ *   Python, pytest, pip – alles läuft INNERHALB von Docker-Containern.
+ *   Das ist die korrekte Produktions-Architektur.
+ *
+ *                 Jenkins-Agent (braucht nur: git + docker)
+ *                      │
+ *          ┌───────────┼───────────┐
+ *          ▼           ▼           ▼
+ *    docker build   docker run  docker run
+ *    (Image bauen) (Tests+Train)(Serving)
+ *          │           │
+ *    Dockerfile.train  └─ python3, pytest, mlflow
+ *                         alles im Container
+ * new jenkins file
+ /
+
 
 pipeline {
 
-    // agent: Wo soll die Pipeline laufen?
-    // 'any' = Jenkins wählt einen freien Build-Agent (Node).
-    // In unserem lokalen Setup = der Jenkins-Container selbst.
     agent any
 
-    // -------------------------------------------------------------------------
-    // environment: Pipeline-weite Variablen
-    //
-    // credentials('mlflow-tracking-uri'):
-    //   Liest den Wert aus dem Jenkins Credential Store (verschlüsselt).
-    //   Wird in SETUP.md erklärt wie man diesen anlegt.
-    //   Der Wert erscheint NIEMALS im Build-Log (Jenkins maskiert ihn automatisch).
-    //
-    // BUILD_NUMBER: Automatische Jenkins-Variable, zählt bei jedem Build hoch.
-    // GIT_COMMIT:   Automatisch, der aktuelle Git-Commit-Hash (z.B. "a1b2c3d").
-    // -------------------------------------------------------------------------
     environment {
         MLFLOW_TRACKING_URI = credentials('mlflow-tracking-uri')
-        DOCKER_REGISTRY     = "localhost:5050"   // Lokale Registry (siehe SETUP.md)
+        DOCKER_REGISTRY     = "localhost:5050"
         IMAGE_NAME          = "iris-classifier"
-        // Image-Tag aus Build-Nummer + kurzem Commit-Hash (eindeutig + nachverfolgbar)
         IMAGE_TAG           = "${BUILD_NUMBER}-${GIT_COMMIT.take(7)}"
         MIN_ACCURACY        = "0.90"
     }
 
-    // -------------------------------------------------------------------------
-    // triggers: Wann soll die Pipeline automatisch starten?
-    //
-    // pollSCM('H/5 * * * *'):
-    //   Jenkins fragt alle 5 Minuten das Git-Repository ab.
-    //   'H' = zufälliger Offset damit nicht alle Jobs gleichzeitig pollen.
-    //   Funktioniert OHNE Webhook, OHNE öffentliche Jenkins-URL.
-    //   Nachteil: bis zu 5 Minuten Verzögerung nach dem Push.
-    //
-    // Wenn Webhook konfiguriert ist (siehe SETUP.md Abschnitt 5):
-    //   Den pollSCM-Trigger entfernen oder auskommentieren.
-    //   Jenkins wird dann sofort nach dem Push getriggert (< 1 Sekunde).
-    // -------------------------------------------------------------------------
     triggers {
         pollSCM('H/5 * * * *')
     }
@@ -77,13 +60,6 @@ pipeline {
         timestamps()
     }
 
-    // -------------------------------------------------------------------------
-    // parameters: Manuelle Eingaben beim Pipeline-Start
-    //
-    // Im Jenkins-UI: "Build with Parameters" → Formular erscheint.
-    // So kann man denselben Code mit verschiedenen Hyperparametern testen
-    // ohne den Code zu ändern.
-    // -------------------------------------------------------------------------
     parameters {
         string(
             name:         'N_ESTIMATORS',
@@ -106,20 +82,8 @@ pipeline {
 
         // -----------------------------------------------------------------
         // Stage 1: Checkout
-        //
-        // checkout scm: Holt den Code aus dem Git-Repository das im
-        // Jenkins-Job konfiguriert ist (siehe SETUP.md Schritt 3).
-        //
-        // Was passiert intern:
-        //   - git clone <repo-url> (beim ersten Mal)
-        //   - git fetch + git checkout <branch> (bei Folge-Builds)
-        //   Jenkins cached das Repository lokal auf dem Build-Agent,
-        //   sodass nicht jedes Mal ein vollständiger Clone nötig ist.
-        //
-        // Nach checkout scm sind folgende Variablen automatisch gesetzt:
-        //   GIT_COMMIT  = vollständiger Commit-Hash
-        //   GIT_BRANCH  = Branch-Name (z.B. "main" oder "origin/main")
-        //   GIT_URL     = Repository-URL
+        // Jenkins holt den Code aus GitHub.
+        // Keine Änderung nötig – hat bereits funktioniert (Log zeigte OK).
         // -----------------------------------------------------------------
         stage('Checkout') {
             steps {
@@ -132,129 +96,94 @@ pipeline {
         }
 
         // -----------------------------------------------------------------
-        // Stage 2: Setup Python-Umgebung
+        // Stage 2: Docker Build
         //
-        // Warum venv statt globalem pip?
-        //   Jeder Jenkins-Build soll isoliert sein.
-        //   Globale pip-Pakete können sich zwischen Jobs gegenseitig stören
-        //   (Versionskonflikt zwischen zwei Projekten auf demselben Agent).
-        //   Mit venv hat jeder Build seine eigene saubere Umgebung.
+        // VORHER: Stage "Setup" (python3 -m venv) → FEHLER
+        // JETZT:  Direkt Docker bauen. Das Image enthält Python.
         //
-        // Warum pip install hier und nicht im Docker-Build?
-        //   Tests (Stage 3) laufen OHNE Docker direkt auf dem Agent.
-        //   Das ist schneller (kein Docker-Overhead) und gibt schnelleres Feedback.
-        //   Der Docker-Container (Stage 4) hat seine eigenen pip installs
-        //   via Dockerfile. Beides ist intentional getrennt.
-        // -----------------------------------------------------------------
-        stage('Setup') {
-            steps {
-                sh '''
-                    python3 -m venv .venv
-                    . .venv/bin/activate
-                    pip install --upgrade pip --quiet
-                    pip install -r requirements.txt --quiet
-                    echo "Python: $(python3 --version)"
-                    echo "pip: $(pip --version)"
-                '''
-            }
-        }
-
-        // -----------------------------------------------------------------
-        // Stage 3: Tests
+        // Warum Docker zuerst, Tests danach?
+        //   Wir brauchen das Image um darin Tests zu laufen.
+        //   Der Container ist unsere "virtuelle Umgebung" –
+        //   sauberer als venv direkt auf dem Agent.
         //
-        // WICHTIG: Diese Stage läuft VOR dem Docker-Build.
-        // Schlagen Tests fehl → Pipeline stoppt sofort.
-        // Docker-Build (2+ Minuten) wird NICHT gestartet.
-        //
-        // --junitxml=test-results.xml:
-        //   pytest schreibt Ergebnisse im JUnit-XML-Format.
-        //   Jenkins liest diese Datei und zeigt die Tests im UI an
-        //   (grüne/rote Symbole, Trend-Grafiken über mehrere Builds).
-        //
-        // post.always { junit '...' }:
-        //   junit-Report wird auch bei fehlgeschlagenen Tests archiviert.
-        //   Sonst sähe man nur "Stage fehlgeschlagen" ohne Details warum.
-        // -----------------------------------------------------------------
-        stage('Tests') {
-            steps {
-                sh '''
-                    . .venv/bin/activate
-                    pytest tests/ -v --tb=short \
-                        --junitxml=test-results.xml \
-                        --log-cli-level=INFO
-                '''
-            }
-            post {
-                always {
-                    // JUnit-Plugin liest die XML-Datei und zeigt Test-Ergebnisse im UI
-                    junit 'test-results.xml'
-                }
-            }
-        }
-
-        // -----------------------------------------------------------------
-        // Stage 4: Docker Build
-        //
-        // Was hier passiert:
-        //   1. Docker liest Dockerfile.train Zeile für Zeile
-        //   2. Jede Zeile wird eine "Layer" (gecacht)
-        //   3. Das fertige Image wird lokal gespeichert
-        //   4. Das Image wird mit zwei Tags versehen:
-        //      - :42-a1b2c3d (spezifisch, unveränderlich)
-        //      - :latest     (zeigt immer auf den neuesten Build)
-        //
-        // --cache-from:
-        //   Docker prüft ob eine Layer unverändert ist → verwendet Cache.
-        //   requirements.txt geändert → pip install neu.
-        //   Nur src/ geändert → pip install gecacht, nur Code-Layer neu.
-        //   Das spart 2-5 Minuten bei jedem Build.
-        //
-        // Warum zwei Tags?
-        //   :latest → Mensch weiß sofort was die aktuellste Version ist
-        //   :42-a1b2c3d → Rollback: "deploy Version 41-xyz" ist möglich
+        // || true beim cache-from:
+        //   Beim allerersten Build existiert kein "latest"-Image.
+        //   Ohne || true würde "cache-from" mit Fehler abbrechen.
+        //   Mit || true: Cache-Fehler wird ignoriert, Build läuft durch.
         // -----------------------------------------------------------------
         stage('Docker Build') {
             steps {
                 sh """
+                    echo "Baue Training-Image …"
                     docker build \\
                         --tag ${DOCKER_REGISTRY}/${IMAGE_NAME}-train:${IMAGE_TAG} \\
                         --tag ${DOCKER_REGISTRY}/${IMAGE_NAME}-train:latest \\
                         --file docker/Dockerfile.train \\
                         --cache-from ${DOCKER_REGISTRY}/${IMAGE_NAME}-train:latest \\
+                        . || docker build \\
+                        --tag ${DOCKER_REGISTRY}/${IMAGE_NAME}-train:${IMAGE_TAG} \\
+                        --tag ${DOCKER_REGISTRY}/${IMAGE_NAME}-train:latest \\
+                        --file docker/Dockerfile.train \\
                         .
-                    echo "Image gebaut: ${IMAGE_NAME}-train:${IMAGE_TAG}"
                 """
             }
         }
 
         // -----------------------------------------------------------------
-        // Stage 5: Training
+        // Stage 3: Tests (laufen INNERHALB des Docker-Containers)
         //
-        // docker run --rm:
-        //   Container wird nach Abschluss automatisch gelöscht.
-        //   Der Workspace (Arbeitsverzeichnis) bleibt erhalten,
-        //   weil er als Volume eingebunden ist.
+        // VORHER: python3 direkt auf Agent → "python3: not found"
+        // JETZT:  docker run → pytest läuft im Container
         //
-        // --network host:
-        //   Der Training-Container nutzt das Netzwerk des Hosts.
-        //   So kann er MLflow auf localhost:5000 erreichen,
-        //   auch wenn MLflow nicht im selben Docker-Netzwerk läuft.
-        //   (Vereinfachung für lokales Setup – in Produktion: eigenes Netzwerk)
+        // --rm:           Container nach Abschluss automatisch löschen
+        // --network host: Container sieht localhost des Hosts
+        //                 (wichtig für MLflow-Verbindung in späteren Stages)
+        // --workdir:      Arbeitsverzeichnis im Container
         //
-        // --volume ${WORKSPACE}:/app/workspace:
-        //   WORKSPACE ist eine Jenkins-Variable (Pfad zum Build-Verzeichnis).
-        //   So können Modell-Artefakte die im Container entstehen
-        //   nach dem Container-Stop noch gelesen werden.
+        // Warum kein --volume für test-results.xml?
+        //   Das XML liegt nach dem Container-Run nicht mehr da (--rm).
+        //   Lösung: Volume mounten damit Jenkins die Datei lesen kann.
+        //   ${WORKSPACE} ist Jenkins' Arbeitsverzeichnis auf dem Host.
+        // -----------------------------------------------------------------
+        stage('Tests') {
+            steps {
+                sh """
+                    echo "Starte Tests im Docker-Container …"
+                    docker run --rm \\
+                        --volume ${WORKSPACE}:/app/workspace \\
+                        --workdir /app \\
+                        ${DOCKER_REGISTRY}/${IMAGE_NAME}-train:${IMAGE_TAG} \\
+                        sh -c "
+                            pip install pytest --quiet &&
+                            pytest tests/ -v --tb=short \\
+                                --junitxml=/app/workspace/test-results.xml \\
+                                --log-cli-level=INFO
+                        "
+                """
+            }
+            post {
+                always {
+                    // test-results.xml liegt jetzt im WORKSPACE (via Volume)
+                    junit allowEmptyResults: true, testResults: 'test-results.xml'
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Stage 4: Training
         //
-        // Exit-Code-Logik:
-        //   train.py ruft SystemExit(1) wenn Accuracy < MIN_ACCURACY.
-        //   docker run gibt diesen Exit-Code weiter.
-        //   Jenkins interpretiert Exit-Code != 0 als Stage-Fehler.
-        //   → Stage 6 (Serving) wird NICHT gestartet.
+        // MLFLOW_TRACKING_URI kommt aus Jenkins Credentials (maskiert im Log).
+        // Der Container verbindet sich über --network host mit MLflow.
+        //
+        // Wichtig: MLflow muss auf dem Host laufen und erreichbar sein.
+        //   Lokal (Docker Desktop Mac/Windows): host.docker.internal:5000
+        //   Lokal (Linux):                      172.17.0.1:5000
+        //   → In SETUP.md Schritt 5b erklärt wie man das Credential setzt.
         // -----------------------------------------------------------------
         stage('Training') {
             steps {
                 sh """
+                    echo "Starte Training im Docker-Container …"
                     docker run --rm \\
                         --network host \\
                         --volume ${WORKSPACE}:/app/workspace \\
@@ -269,7 +198,7 @@ pipeline {
         }
 
         // -----------------------------------------------------------------
-        // Stage 6: Serving-Image bauen
+        // Stage 5: Serving-Image bauen
         // -----------------------------------------------------------------
         stage('Build Serving Image') {
             steps {
@@ -278,35 +207,24 @@ pipeline {
                         --tag ${DOCKER_REGISTRY}/${IMAGE_NAME}-serve:${IMAGE_TAG} \\
                         --tag ${DOCKER_REGISTRY}/${IMAGE_NAME}-serve:latest \\
                         --file docker/Dockerfile.serve \\
-                        --cache-from ${DOCKER_REGISTRY}/${IMAGE_NAME}-serve:latest \\
+                        . || docker build \\
+                        --tag ${DOCKER_REGISTRY}/${IMAGE_NAME}-serve:${IMAGE_TAG} \\
+                        --tag ${DOCKER_REGISTRY}/${IMAGE_NAME}-serve:latest \\
+                        --file docker/Dockerfile.serve \\
                         .
                 """
             }
         }
 
         // -----------------------------------------------------------------
-        // Stage 7: Deploy
+        // Stage 6: Deploy
         //
-        // Lokales Deployment: Der laufende Serving-Container wird
-        // durch eine neue Version ersetzt.
-        //
-        // docker stop + docker rm: Alten Container stoppen und entfernen.
-        //   "|| true": Fehler ignorieren falls Container nicht läuft
-        //              (z.B. beim allerersten Deployment).
-        //
-        // docker run -d: Container im Hintergrund starten (-d = detach).
-        //   --name iris-serve: Fixer Name damit spätere Deployments ihn
-        //                      per Name finden und ersetzen können.
-        //   --restart unless-stopped: Container startet nach Server-Neustart
-        //                             automatisch wieder.
-        //
-        // In Produktion würde hier stehen:
-        //   kubectl set image deployment/iris-serve ...
-        //   (Kubernetes übernimmt Rolling Update, Healthcheck, Rollback)
+        // Nur auf main-Branch.
+        // Stoppt den alten Container und startet den neuen.
+        // || true: kein Fehler wenn beim ersten Mal noch kein Container läuft.
         // -----------------------------------------------------------------
         stage('Deploy') {
             when {
-                // Nur auf main-Branch deployen, nicht auf Feature-Branches
                 branch 'main'
             }
             steps {
@@ -325,7 +243,7 @@ pipeline {
                         --env PORT=8080 \\
                         ${DOCKER_REGISTRY}/${IMAGE_NAME}-serve:${IMAGE_TAG}
 
-                    echo "Warte auf Healthcheck …"
+                    echo "Warte 10s auf Container-Start …"
                     sleep 10
                     curl --fail --silent http://localhost:8080/health \\
                         && echo "Deployment erfolgreich!" \\
@@ -335,26 +253,16 @@ pipeline {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // post: Was passiert NACH allen Stages?
-    //
-    // success / failure / always:
-    //   Werden je nach Pipeline-Ergebnis ausgeführt.
-    //   'always' läuft immer, auch wenn eine Stage fehlschlug.
-    //
-    // Aufräumen:
-    //   .venv entfernen → spart Festplattenspeicher auf dem Build-Agent.
-    //   docker image prune → entfernt ungetaggte ("dangling") Images.
-    // -------------------------------------------------------------------------
     post {
         success {
-            echo "Pipeline #${BUILD_NUMBER} erfolgreich! Model-Tag: ${IMAGE_TAG}"
+            echo "Pipeline #${BUILD_NUMBER} erfolgreich! Tag: ${IMAGE_TAG}"
         }
         failure {
-            echo "Pipeline #${BUILD_NUMBER} fehlgeschlagen. Prüfe die Logs oben."
+            echo "Pipeline #${BUILD_NUMBER} fehlgeschlagen. Prüfe die Stage-Logs oben."
         }
         always {
-            sh 'rm -rf .venv test-results.xml || true'
+            // Aufräumen – kein python3 nötig, nur shell-Befehle
+            sh 'rm -f test-results.xml || true'
             sh 'docker image prune -f || true'
         }
     }
