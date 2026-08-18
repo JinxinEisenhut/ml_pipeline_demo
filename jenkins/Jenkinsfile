@@ -82,6 +82,7 @@ pipeline {
             steps {
                 sh """
                     docker run --rm \\
+                        --user root \\
                         --network host \\
                         --volume ${WORKSPACE}:/app/workspace \\
                         --env MLFLOW_TRACKING_URI=${MLFLOW_TRACKING_URI} \\
