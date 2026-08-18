@@ -25,7 +25,7 @@ import pytest
 from sklearn.datasets import load_iris
 from sklearn.ensemble import RandomForestClassifier
 
-from train import evaluate_model, load_data, split_data, train_model
+from src.train import evaluate_model, load_data, split_data, train_model
 
 
 # ---------------------------------------------------------------------------
