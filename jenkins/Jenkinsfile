@@ -51,8 +51,20 @@ pipeline {
 
         stage('Tests') {
             steps {
+                // --user root: NUR für diesen einen, kurzlebigen (--rm) Container.
+                // Grund: das Dockerfile.train lässt den Prozess normalerweise als
+                // "mluser" laufen (UID meist 1000) – eine bewusste Sicherheitsmaßnahme
+                // für den Trainings-Alltag. Hier jedoch muss pytest eine Datei
+                // (test-results.xml) in das über --volume eingehängte Jenkins-
+                // Workspace-Verzeichnis schreiben, welches dem "jenkins"-Benutzer
+                // im JENKINS-Container gehört (andere, unabhängige UID).
+                // root (UID 0) umgeht Dateiberechtigungsprüfungen grundsätzlich,
+                // das löst den Schreibkonflikt sauber für genau diesen Aufruf –
+                // ohne den Trainings-Container generell als root laufen zu lassen
+                // und ohne den Jenkins-Benutzer selbst zu verändern.
                 sh """
                     docker run --rm \\
+                        --user root \\
                         --volume ${WORKSPACE}:/app/workspace \\
                         --workdir /app \\
                         ${DOCKER_REGISTRY}/${IMAGE_NAME}-train:${IMAGE_TAG} \\
